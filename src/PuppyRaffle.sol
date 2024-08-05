@@ -5,6 +5,7 @@ import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {Base64} from "lib/base64/base64.sol";
+import {console} from "../lib/forge-std/src/console.sol";
 
 /// @title PuppyRaffle
 /// @author PuppyLoveDAO
@@ -77,28 +78,33 @@ contract PuppyRaffle is ERC721, Ownable {
     /// @notice duplicate entrants are not allowed
     /// @param newPlayers the list of players to enter the raffle
     function enterRaffle(address[] memory newPlayers) public payable {
+        // q What if the array is 0?
+        // What about the address(0)
         require(msg.value == entranceFee * newPlayers.length, "PuppyRaffle: Must send enough to enter raffle");
         for (uint256 i = 0; i < newPlayers.length; i++) {
             players.push(newPlayers[i]);
         }
 
         // Check for duplicates
+// @audit DoS, it will spend too much gas if in the raffle there's a lot of people, so for the people that joins at the end of the raffle will pay more
+// than the firsts ones. Increases the gas price till the protocol is unusable.
         for (uint256 i = 0; i < players.length - 1; i++) {
             for (uint256 j = i + 1; j < players.length; j++) {
                 require(players[i] != players[j], "PuppyRaffle: Duplicate player");
             }
         }
+        // @audit We emit the event even if the array is empty? Waste of gas
         emit RaffleEnter(newPlayers);
     }
 
     /// @param playerIndex the index of the player to refund. You can find it externally by calling `getActivePlayerIndex`
     /// @dev This function will allow there to be blank spots in the array
-    // @audit reentrancy propable
+    
     function refund(uint256 playerIndex) public {
         address playerAddress = players[playerIndex];
         require(playerAddress == msg.sender, "PuppyRaffle: Only the player can refund");
         require(playerAddress != address(0), "PuppyRaffle: Player already refunded, or is not active");
-
+        // @audit reentrancy propable
         payable(msg.sender).sendValue(entranceFee);
 
         players[playerIndex] = address(0);
@@ -114,6 +120,7 @@ contract PuppyRaffle is ERC721, Ownable {
                 return i;
             }
         }
+        // @audit what if the player is at index 0, would return 0 and the player can think is not active.
         return 0;
     }
 
@@ -123,20 +130,30 @@ contract PuppyRaffle is ERC721, Ownable {
     /// @dev we use a hash of on-chain data to generate the random numbers
     /// @dev we reset the active players array after the winner is selected
     /// @dev we send 80% of the funds to the winner, the other 20% goes to the feeAddress
+    // @audit what happen if everyone or someone refunded, doesn't check for address(0), the winner could be an address(0)?
     function selectWinner() external {
+        // IT doesn't check for address(0)?
         require(block.timestamp >= raffleStartTime + raffleDuration, "PuppyRaffle: Raffle not over");
         require(players.length >= 4, "PuppyRaffle: Need at least 4 players");
+        // @audit randomness not random. we can know the index if we know the data of what is making this index. 
+        // If we can know the msg.sender, block.timestamp and block.difficulty and the length of the players, then we can use that to guess the index, therefore use that 
+        // in  advantage to us.
         uint256 winnerIndex =
             uint256(keccak256(abi.encodePacked(msg.sender, block.timestamp, block.difficulty))) % players.length;
         address winner = players[winnerIndex];
+        // Why just not put address(this).balance
+        // What happen if is 0
+        // @audit this would be wrong if ther's somebody that refunded because address(0) is counting as a player 
         uint256 totalAmountCollected = players.length * entranceFee;
         uint256 prizePool = (totalAmountCollected * 80) / 100;
         uint256 fee = (totalAmountCollected * 20) / 100;
+        // @audit overflow, unsafe cast
         totalFees = totalFees + uint64(fee);
 
         uint256 tokenId = totalSupply();
 
         // We use a different RNG calculate from the winnerIndex to determine rarity
+        // @audit weak randomness, revert the transaction and call selectWinner again till we get the legendary rarity
         uint256 rarity = uint256(keccak256(abi.encodePacked(msg.sender, block.difficulty))) % 100;
         if (rarity <= COMMON_RARITY) {
             tokenIdToRarity[tokenId] = COMMON_RARITY;
@@ -149,6 +166,8 @@ contract PuppyRaffle is ERC721, Ownable {
         delete players;
         raffleStartTime = block.timestamp;
         previousWinner = winner;
+        // @audit potencial reentrancy, not at all in this function because theres a checker of the raffleStartTime adn we resset it previously so probably would revert
+        // What happens if we revert the call, is it a big issue if the winner doesn't get the mint NFT?
         (bool success,) = winner.call{value: prizePool}("");
         require(success, "PuppyRaffle: Failed to send prize pool to winner");
         _safeMint(winner, tokenId);
@@ -156,9 +175,13 @@ contract PuppyRaffle is ERC721, Ownable {
 
     /// @notice this function will withdraw the fees to the feeAddress
     function withdrawFees() external {
+        // What happens if we have more balance? Never withdraw the fees?
+        // @audit mishandling ETH, if we send ETH to this contract (we shouldn't because it dopesn't have any receive and fallback function), then this function becomes unavailable
+        // Selfdstruct
         require(address(this).balance == uint256(totalFees), "PuppyRaffle: There are currently players active!");
         uint256 feesToWithdraw = totalFees;
         totalFees = 0;
+        // What if we change the feeAddress and fail
         (bool success,) = feeAddress.call{value: feesToWithdraw}("");
         require(success, "PuppyRaffle: Failed to withdraw fees");
     }
@@ -171,6 +194,10 @@ contract PuppyRaffle is ERC721, Ownable {
     }
 
     /// @notice this function will return true if the msg.sender is an active player
+    // @audit this isn't used anywhere
+    // IMPACT: None
+    // LIKELYHOOD: None
+    // It's a waste of gas, I/G report
     function _isActivePlayer() internal view returns (bool) {
         for (uint256 i = 0; i < players.length; i++) {
             if (players[i] == msg.sender) {
@@ -193,7 +220,7 @@ contract PuppyRaffle is ERC721, Ownable {
         uint256 rarity = tokenIdToRarity[tokenId];
         string memory imageURI = rarityToUri[rarity];
         string memory rareName = rarityToName[rarity];
-
+        // @audit theres a way to mess this up? Playing with the variables name(), rareName, imageURI
         return string(
             abi.encodePacked(
                 _baseURI(),
